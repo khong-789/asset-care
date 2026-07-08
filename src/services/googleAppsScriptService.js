@@ -1,5 +1,5 @@
 export const GOOGLE_APPS_SCRIPT_WEB_APP_URL = (import.meta.env.VITE_APPS_SCRIPT_URL || "").trim();
-export const PUBLIC_APP_URL = (import.meta.env.VITE_PUBLIC_APP_URL || window.location.origin).replace(/\/$/, "");
+export const PUBLIC_APP_URL = (import.meta.env.VITE_PUBLIC_APP_URL || "").trim().replace(/\/$/, "");
 
 const ensureConfigured = () => {
   if (!GOOGLE_APPS_SCRIPT_WEB_APP_URL) {

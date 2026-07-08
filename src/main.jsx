@@ -49,7 +49,7 @@ const getVendorContact = (asset) => asset.vendorContact || asset.vendorPhone || 
 const getNotes = (asset) => asset.notes || asset.note || "";
 const uniq = (items, fallback = []) => [...new Set([...items.filter(Boolean), ...fallback])];
 const validDate = (value) => value && !Number.isNaN(new Date(value).getTime());
-const getAssetUrl = (asset) => `${appsScriptService.PUBLIC_APP_URL}/asset/${asset.id}`;
+const getAssetUrl = (asset) => (appsScriptService.PUBLIC_APP_URL ? `${appsScriptService.PUBLIC_APP_URL}/asset/${asset.id}` : `/asset/${asset.id}`);
 const withAssetDerivedFields = (asset) => ({
   ...asset,
   imageUrl: asset.imageUrl || "",
@@ -361,7 +361,7 @@ function App() {
         ...payload,
         id: newId,
         organizationId: ORG_ID,
-        qrCodeUrl: `${appsScriptService.PUBLIC_APP_URL}/asset/${newId}`,
+        qrCodeUrl: getAssetUrl({ id: newId }),
         imageUrl: payload.imageUrl || "",
         imageFileName: payload.imageFileName || "",
         imageUpdatedAt: payload.imageUpdatedAt || "",
