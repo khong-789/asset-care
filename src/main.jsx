@@ -63,6 +63,14 @@ const getAssetIdFromPath = () => {
 };
 const IMAGE_ACCEPT = "image/jpeg,image/png,image/webp";
 const MAX_IMAGE_SIZE = 5 * 1024 * 1024;
+const LOCAL_FALLBACK_MESSAGE = "\u0e01\u0e33\u0e25\u0e31\u0e07\u0e43\u0e0a\u0e49\u0e02\u0e49\u0e2d\u0e21\u0e39\u0e25\u0e20\u0e32\u0e22\u0e43\u0e19\u0e40\u0e04\u0e23\u0e37\u0e48\u0e2d\u0e07 \u0e23\u0e39\u0e1b\u0e08\u0e30\u0e44\u0e21\u0e48\u0e0b\u0e34\u0e07\u0e01\u0e4c\u0e02\u0e49\u0e32\u0e21\u0e2d\u0e38\u0e1b\u0e01\u0e23\u0e13\u0e4c";
+const isTemporaryImageUrl = (value = "") => /^blob:|^data:image\//.test(String(value));
+const stripTemporaryImageFields = (asset, { includeUpload = false } = {}) => {
+  const { imagePreviewUrl, imageBase64, ...clean } = asset;
+  if (includeUpload && imageBase64) clean.imageBase64 = imageBase64;
+  if (isTemporaryImageUrl(clean.imageUrl)) clean.imageUrl = "";
+  return clean;
+};
 const readImageFile = (file) =>
   new Promise((resolve, reject) => {
     if (!file) {
@@ -78,7 +86,7 @@ const readImageFile = (file) =>
       return;
     }
     const reader = new FileReader();
-    reader.onload = () => resolve({ imageUrl: reader.result, imageFileName: file.name, imageUpdatedAt: new Date().toISOString() });
+    reader.onload = () => resolve({ imagePreviewUrl: reader.result, imageBase64: reader.result, imageFileName: file.name, imageUpdatedAt: new Date().toISOString() });
     reader.onerror = () => reject(new Error("อ่านไฟล์รูปไม่สำเร็จ"));
     reader.readAsDataURL(file);
   });
@@ -191,7 +199,7 @@ function App() {
   const [activePage, setActivePage] = useState("dashboard");
   const [currentUser, setCurrentUser] = useState(loadCurrentUser);
   const [dataMode, setDataMode] = useState(appsScriptService.isAppsScriptConfigured() ? "loading" : "local");
-  const [dataMessage, setDataMessage] = useState(appsScriptService.isAppsScriptConfigured() ? "" : "กำลังใช้งานข้อมูลภายในเครื่อง");
+  const [dataMessage, setDataMessage] = useState(appsScriptService.isAppsScriptConfigured() ? "" : LOCAL_FALLBACK_MESSAGE);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [modal, setModal] = useState(null);
   const [filters, setFilters] = useState({
@@ -218,7 +226,7 @@ function App() {
     localStorage.setItem("asset-care-db", JSON.stringify(normalized));
   };
 
-  const markLocalFallback = (message = "กำลังใช้งานข้อมูลภายในเครื่อง") => {
+  const markLocalFallback = (message = LOCAL_FALLBACK_MESSAGE) => {
     setDataMode("local");
     setDataMessage(message);
   };
@@ -240,7 +248,7 @@ function App() {
       setDataMode("remote");
       setDataMessage("");
     } catch (error) {
-      markLocalFallback("กำลังใช้งานข้อมูลภายในเครื่อง");
+      markLocalFallback();
     }
   };
 
@@ -326,16 +334,35 @@ function App() {
     await Promise.all(items.map((item) => appsScriptService.createHistoryLog(item)));
   };
 
+  const confirmRemoteAssetImage = async (assetId, requiredImageUrl) => {
+    const remoteAsset = await appsScriptService.getAssetById(assetId);
+    if (!remoteAsset) {
+      throw new Error("ไม่พบข้อมูลทรัพย์สินหลังบันทึกใน Google Sheet");
+    }
+    const confirmed = withAssetDerivedFields(remoteAsset);
+    if (requiredImageUrl && !confirmed.imageUrl) {
+      throw new Error("อัปโหลดรูปสำเร็จไม่ครบถ้วน: Google Sheet ยังไม่มี imageUrl");
+    }
+    if (confirmed.imageUrl && isTemporaryImageUrl(confirmed.imageUrl)) {
+      throw new Error("Google Sheet มี imageUrl แบบชั่วคราว กรุณาอัปโหลดรูปใหม่");
+    }
+    return confirmed;
+  };
+
   const saveAsset = async (payload, existing) => {
     if (existing && currentUser.role !== "admin") return;
     const now = new Date().toISOString();
+    const remoteReady = appsScriptService.isAppsScriptConfigured() && dataMode === "remote";
+    const hasImageUpload = Boolean(payload.imageBase64);
     if (existing) {
-      let updated = { ...existing, ...payload, id: existing.id, organizationId: ORG_ID, updatedAt: now };
-      if (appsScriptService.isAppsScriptConfigured() && dataMode === "remote") {
+      let updated = stripTemporaryImageFields({ ...existing, ...payload, id: existing.id, organizationId: ORG_ID, updatedAt: now }, { includeUpload: remoteReady });
+      if (remoteReady) {
         try {
-          updated = withAssetDerivedFields(await appsScriptService.updateAsset(existing.id, updated));
+          await appsScriptService.updateAsset(existing.id, updated);
+          updated = await confirmRemoteAssetImage(existing.id, hasImageUpload);
+          await syncRemoteDb();
         } catch (error) {
-          markLocalFallback("กำลังใช้งานข้อมูลภายในเครื่อง");
+          throw new Error(`บันทึกรูป/ข้อมูลไป Google Apps Script ไม่สำเร็จ: ${error.message}`);
         }
       }
       const nextAssets = db.assets.map((asset) => (asset.id === existing.id ? updated : asset));
@@ -348,7 +375,8 @@ function App() {
       try {
         await writeRemoteHistory(historyItems);
       } catch (error) {
-        markLocalFallback("กำลังใช้งานข้อมูลภายในเครื่อง");
+        if (remoteReady) throw error;
+        markLocalFallback();
       }
       persist({
         ...db,
@@ -357,22 +385,25 @@ function App() {
       });
     } else {
       const newId = payload.assetCode || `AC-${Date.now()}`;
+      const cleanPayload = stripTemporaryImageFields(payload, { includeUpload: remoteReady });
       let newAsset = {
-        ...payload,
+        ...cleanPayload,
         id: newId,
         organizationId: ORG_ID,
         qrCodeUrl: getAssetUrl({ id: newId }),
-        imageUrl: payload.imageUrl || "",
+        imageUrl: cleanPayload.imageUrl || "",
         imageFileName: payload.imageFileName || "",
         imageUpdatedAt: payload.imageUpdatedAt || "",
         createdAt: now,
         updatedAt: now
       };
-      if (appsScriptService.isAppsScriptConfigured() && dataMode === "remote") {
+      if (remoteReady) {
         try {
-          newAsset = withAssetDerivedFields(await appsScriptService.createAsset(newAsset));
+          await appsScriptService.createAsset(newAsset);
+          newAsset = await confirmRemoteAssetImage(newAsset.id, hasImageUpload);
+          await syncRemoteDb();
         } catch (error) {
-          markLocalFallback("กำลังใช้งานข้อมูลภายในเครื่อง");
+          throw new Error(`บันทึกรูป/ข้อมูลไป Google Apps Script ไม่สำเร็จ: ${error.message}`);
         }
       }
       const historyItems = [
@@ -382,7 +413,8 @@ function App() {
       try {
         await writeRemoteHistory(historyItems);
       } catch (error) {
-        markLocalFallback("กำลังใช้งานข้อมูลภายในเครื่อง");
+        if (remoteReady) throw error;
+        markLocalFallback();
       }
       persist({
         ...db,
@@ -416,12 +448,16 @@ function App() {
   };
 
   const updateAssetImage = async (asset, imagePayload) => {
-    let updated = { ...asset, ...imagePayload, updatedAt: new Date().toISOString() };
-    if (appsScriptService.isAppsScriptConfigured() && dataMode === "remote") {
+    const remoteReady = appsScriptService.isAppsScriptConfigured() && dataMode === "remote";
+    const hasImageUpload = Boolean(imagePayload.imageBase64);
+    let updated = stripTemporaryImageFields({ ...asset, ...imagePayload, updatedAt: new Date().toISOString() }, { includeUpload: remoteReady });
+    if (remoteReady) {
       try {
-        updated = withAssetDerivedFields(await appsScriptService.updateAsset(asset.id, updated));
+        await appsScriptService.updateAsset(asset.id, updated);
+        updated = await confirmRemoteAssetImage(asset.id, hasImageUpload);
+        await syncRemoteDb();
       } catch (error) {
-        markLocalFallback("กำลังใช้งานข้อมูลภายในเครื่อง");
+        throw new Error(`อัปโหลดรูปไป Google Drive ไม่สำเร็จ: ${error.message}`);
       }
     }
     const imageDetail = !asset.imageUrl && updated.imageUrl ? "เพิ่มรูปทรัพย์สิน" : asset.imageUrl && !updated.imageUrl ? "ลบรูปทรัพย์สิน" : "เปลี่ยนรูปทรัพย์สิน";
@@ -429,7 +465,8 @@ function App() {
     try {
       await writeRemoteHistory([historyItem]);
     } catch (error) {
-      markLocalFallback("กำลังใช้งานข้อมูลภายในเครื่อง");
+      if (remoteReady) throw error;
+      markLocalFallback();
     }
     persist({
       ...db,
@@ -1076,17 +1113,7 @@ function AssetManagement({ assets, allAssets, filters, setFilters, currentUser, 
                   <td>{getNextCheckDate(asset)}</td>
                   <td>{getResponsiblePerson(asset)}</td>
                   <td className="sticky right-0 bg-white">
-                    <div className="flex min-w-[300px] gap-1">
-                      <IconButton title="ดูรายละเอียด" onClick={() => openModal({ type: "detail", asset })} icon={Eye} />
-                      {isAdmin && <IconButton title="แก้ไข" onClick={() => openModal({ type: "asset", asset })} icon={Edit3} />}
-                      <IconButton title={asset.imageUrl ? "เปลี่ยนรูป" : "เพิ่มรูป"} onClick={() => openModal({ type: "editImage", asset })} icon={Archive} />
-                      <IconButton title="ตรวจเช็ก" onClick={() => openModal({ type: "check", asset })} icon={ClipboardCheck} />
-                      <IconButton title="แจ้งซ่อม" onClick={() => openModal({ type: "repair", asset })} icon={Wrench} />
-                      <IconButton title="ย้ายตำแหน่ง" onClick={() => openModal({ type: "move", asset })} icon={ArrowLeftRight} />
-                      <IconButton title="ดู QR" onClick={() => openModal({ type: "qr", asset })} icon={QrCode} />
-                      <IconButton title="พิมพ์ QR" onClick={() => openModal({ type: "qr", asset, autoPrint: true })} icon={Printer} />
-                      {isAdmin && <IconButton title="ลบ" onClick={() => deleteAsset(asset)} icon={Trash2} danger />}
-                    </div>
+                    <AssetActionButtons asset={asset} isAdmin={isAdmin} openModal={openModal} deleteAsset={deleteAsset} />
                   </td>
                 </tr>
               ))}
@@ -1117,6 +1144,34 @@ function IconButton({ title, onClick, icon: Icon, danger }) {
   );
 }
 
+function AssetActionButtons({ asset, isAdmin, openModal, deleteAsset }) {
+  const actionButtons = [
+    { title: "ดูรายละเอียด", icon: Eye, onClick: () => openModal({ type: "detail", asset }) },
+    ...(isAdmin ? [{ title: "แก้ไข", icon: Edit3, onClick: () => openModal({ type: "asset", asset }) }] : []),
+    { title: asset.imageUrl ? "เปลี่ยนรูป" : "เพิ่มรูป", icon: Archive, onClick: () => openModal({ type: "editImage", asset }) },
+    { title: "ตรวจเช็ก", icon: ClipboardCheck, onClick: () => openModal({ type: "check", asset }) },
+    { title: "แจ้งซ่อม", icon: Wrench, onClick: () => openModal({ type: "repair", asset }) },
+    { title: "ย้ายตำแหน่ง", icon: ArrowLeftRight, onClick: () => openModal({ type: "move", asset }) },
+    { title: "ดู QR", icon: QrCode, onClick: () => openModal({ type: "qr", asset }) },
+    { title: "พิมพ์ QR", icon: Printer, onClick: () => openModal({ type: "qr", asset, autoPrint: true }) },
+    ...(isAdmin ? [{ title: "ลบ", icon: Trash2, danger: true, onClick: () => deleteAsset(asset) }] : [])
+  ];
+  return (
+    <div className="asset-actions">
+      <div className="asset-actions-desktop">
+        {actionButtons.map((button) => (
+          <IconButton key={button.title} title={button.title} onClick={button.onClick} icon={button.icon} danger={button.danger} />
+        ))}
+      </div>
+      <div className="asset-actions-mobile">
+        {actionButtons.map((button) => (
+          <IconButton key={button.title} title={button.title} onClick={button.onClick} icon={button.icon} danger={button.danger} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function StatusBadge({ status }) {
   return <span className={`inline-flex whitespace-nowrap rounded-full px-2.5 py-1 text-xs font-medium ring-1 ${statusClass[status] || "bg-slate-100 text-slate-700 ring-slate-200"}`}>{status}</span>;
 }
@@ -1126,7 +1181,7 @@ function AssetImageThumb({ asset, size = "sm", onClick }) {
   if (asset.imageUrl) {
     return (
       <button className={`${sizeClass} overflow-hidden rounded-md border border-slate-200 bg-white`} onClick={onClick} type="button">
-        <img src={asset.imageUrl} alt={asset.assetName} className="h-full w-full object-cover" />
+        <ImageWithFallback src={asset.imageUrl} alt={asset.assetName} className="h-full w-full object-cover" compact={size !== "lg"} />
       </button>
     );
   }
@@ -1135,6 +1190,21 @@ function AssetImageThumb({ asset, size = "sm", onClick }) {
       <Archive size={size === "lg" ? 34 : 18} />
     </div>
   );
+}
+
+function ImageWithFallback({ src, alt, className, compact = false }) {
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    setFailed(false);
+  }, [src]);
+  if (!src || failed) {
+    return (
+      <div className={`grid place-items-center bg-slate-50 text-center font-medium text-rose-700 ${className || ""}`}>
+        <span className={compact ? "px-1 text-[10px] leading-tight" : "px-3 text-sm"}>โหลดรูปไม่สำเร็จ</span>
+      </div>
+    );
+  }
+  return <img src={src} alt={alt} className={className} onError={() => setFailed(true)} />;
 }
 
 function ModalShell({ title, children, onClose, wide = false, side = false }) {
@@ -1216,7 +1286,7 @@ function QrModal({ asset, autoPrint, onClose }) {
           {asset.imageUrl && (
             <div>
               <p className="mb-2 text-sm font-semibold">รูปทรัพย์สิน</p>
-              <img src={asset.imageUrl} alt={asset.assetName} className="h-28 w-28 rounded-md border border-slate-200 object-cover" />
+              <ImageWithFallback src={asset.imageUrl} alt={asset.assetName} className="h-28 w-28 rounded-md border border-slate-200 object-cover" compact />
             </div>
           )}
         </div>
@@ -1244,7 +1314,7 @@ function ImagePreviewModal({ asset, onClose }) {
     <ModalShell title="รูปทรัพย์สิน" onClose={onClose}>
       <div className="space-y-3">
         <div className="overflow-hidden rounded-md border border-slate-200 bg-slate-50">
-          <img src={asset.imageUrl} alt={asset.assetName} className="max-h-[70vh] w-full object-contain" />
+          <ImageWithFallback src={asset.imageUrl} alt={asset.assetName} className="max-h-[70vh] w-full object-contain" />
         </div>
         <div>
           <p className="font-semibold">{asset.assetName}</p>
@@ -1260,7 +1330,7 @@ function HistoryImageModal({ log, onClose }) {
     <ModalShell title="รูปประกอบเหตุการณ์" onClose={onClose}>
       <div className="space-y-3">
         <div className="overflow-hidden rounded-md border border-slate-200 bg-slate-50">
-          <img src={log.attachmentImageUrl} alt={log.attachmentFileName || log.actionType} className="max-h-[70vh] w-full object-contain" />
+          <ImageWithFallback src={log.attachmentImageUrl} alt={log.attachmentFileName || log.actionType} className="max-h-[70vh] w-full object-contain" />
         </div>
         <div>
           <p className="font-semibold">{log.actionType}</p>
@@ -1274,6 +1344,8 @@ function HistoryImageModal({ log, onClose }) {
 function AssetImageForm({ asset, onClose, onSave }) {
   const [form, setForm] = useState({
     imageUrl: asset.imageUrl || "",
+    imagePreviewUrl: "",
+    imageBase64: "",
     imageFileName: asset.imageFileName || "",
     imageUpdatedAt: asset.imageUpdatedAt || ""
   });
@@ -1285,7 +1357,7 @@ function AssetImageForm({ asset, onClose, onSave }) {
     try {
       const image = await readImageFile(file);
       setImageError("");
-      setForm(image);
+      setForm({ ...form, ...image, imageUrl: "" });
     } catch (error) {
       setImageError(error.message);
     } finally {
@@ -1302,16 +1374,16 @@ function AssetImageForm({ asset, onClose, onSave }) {
         </div>
         <div className="grid gap-4 sm:grid-cols-[120px_minmax(0,1fr)]">
           <div className="h-28 w-28 overflow-hidden rounded-md border border-slate-200 bg-slate-50">
-            {form.imageUrl ? <img src={form.imageUrl} alt="preview" className="h-full w-full object-cover" /> : <div className="grid h-full place-items-center text-xs text-slate-500">ยังไม่มีรูป</div>}
+            {form.imagePreviewUrl || form.imageUrl ? <img src={form.imagePreviewUrl || form.imageUrl} alt="preview" className="h-full w-full object-cover" /> : <div className="grid h-full place-items-center text-xs text-slate-500">ยังไม่มีรูป</div>}
           </div>
           <div className="space-y-3">
-            <input className="input" value={form.imageUrl} placeholder="URL รูปภาพ หรือเลือกไฟล์" onChange={(e) => setForm({ ...form, imageUrl: e.target.value, imageUpdatedAt: new Date().toISOString() })} />
+            <input className="input" value={form.imageUrl} placeholder="URL รูปภาพถาวร หรือเลือกไฟล์" onChange={(e) => setForm({ ...form, imageUrl: e.target.value, imagePreviewUrl: "", imageBase64: "", imageUpdatedAt: new Date().toISOString() })} />
             <div className="flex flex-wrap gap-2">
               <label className="btn-secondary cursor-pointer">
                 เลือกรูป
                 <input className="hidden" type="file" accept={IMAGE_ACCEPT} onChange={handleImageFile} />
               </label>
-              {form.imageUrl && <button className="btn-secondary" type="button" onClick={() => setForm({ imageUrl: "", imageFileName: "", imageUpdatedAt: new Date().toISOString() })}>ลบรูป</button>}
+              {(form.imagePreviewUrl || form.imageUrl) && <button className="btn-secondary" type="button" onClick={() => setForm({ imageUrl: "", imagePreviewUrl: "", imageBase64: "", imageFileName: "", imageUpdatedAt: new Date().toISOString() })}>ลบรูป</button>}
             </div>
             {form.imageFileName && <p className="text-xs text-slate-500">ไฟล์: {form.imageFileName}</p>}
             {imageError && <p className="text-sm font-medium text-rose-700">{imageError}</p>}
@@ -1345,6 +1417,8 @@ function AssetForm({ asset, settings, onClose, onSave }) {
     vendorContact: "",
     notes: "",
     imageUrl: "",
+    imagePreviewUrl: "",
+    imageBase64: "",
     imageFileName: "",
     imageUpdatedAt: "",
     qrCode: "",
@@ -1358,7 +1432,7 @@ function AssetForm({ asset, settings, onClose, onSave }) {
     try {
       const image = await readImageFile(file);
       setImageError("");
-      setForm({ ...form, ...image });
+      setForm({ ...form, ...image, imageUrl: "" });
     } catch (error) {
       setImageError(error.message);
     } finally {
@@ -1366,7 +1440,7 @@ function AssetForm({ asset, settings, onClose, onSave }) {
     }
   };
   const removeImage = () => {
-    setForm({ ...form, imageUrl: "", imageFileName: "", imageUpdatedAt: new Date().toISOString() });
+    setForm({ ...form, imageUrl: "", imagePreviewUrl: "", imageBase64: "", imageFileName: "", imageUpdatedAt: new Date().toISOString() });
     setImageError("");
   };
   return (
@@ -1394,22 +1468,22 @@ function AssetForm({ asset, settings, onClose, onSave }) {
           <div className="rounded-md border border-slate-200 p-3">
             <div className="mb-3 flex flex-wrap items-center gap-3">
               <div className="h-24 w-24 overflow-hidden rounded-md border border-slate-200 bg-slate-50">
-                {form.imageUrl ? <img src={form.imageUrl} alt="preview" className="h-full w-full object-cover" /> : <div className="grid h-full place-items-center text-xs text-slate-500">ยังไม่มีรูป</div>}
+                {form.imagePreviewUrl || form.imageUrl ? <img src={form.imagePreviewUrl || form.imageUrl} alt="preview" className="h-full w-full object-cover" /> : <div className="grid h-full place-items-center text-xs text-slate-500">ยังไม่มีรูป</div>}
               </div>
               <div className="min-w-0 flex-1 space-y-2">
-                <input className="input" value={form.imageUrl || ""} placeholder="URL รูปภาพ หรือเลือกไฟล์ด้านล่าง" onChange={(e) => setForm({ ...form, imageUrl: e.target.value, imageUpdatedAt: new Date().toISOString() })} />
+                <input className="input" value={form.imageUrl || ""} placeholder="URL รูปภาพถาวร หรือเลือกไฟล์ด้านล่าง" onChange={(e) => setForm({ ...form, imageUrl: e.target.value, imagePreviewUrl: "", imageBase64: "", imageUpdatedAt: new Date().toISOString() })} />
                 <div className="flex flex-wrap gap-2">
                   <label className="btn-secondary cursor-pointer">
                     เปลี่ยน/อัปโหลดรูป
                     <input className="hidden" type="file" accept={IMAGE_ACCEPT} onChange={handleImageFile} />
                   </label>
-                  {form.imageUrl && <button className="btn-secondary" type="button" onClick={removeImage}>ลบรูป</button>}
+                  {(form.imagePreviewUrl || form.imageUrl) && <button className="btn-secondary" type="button" onClick={removeImage}>ลบรูป</button>}
                 </div>
                 {form.imageFileName && <p className="text-xs text-slate-500">ไฟล์: {form.imageFileName}</p>}
                 {imageError && <p className="text-sm font-medium text-rose-700">{imageError}</p>}
               </div>
             </div>
-            <p className="text-xs text-slate-500">รองรับ jpg, jpeg, png, webp ขนาดไม่เกิน 5MB ขณะนี้บันทึกเป็น base64 ใน localStorage และควรเชื่อมต่อ backend/storage เมื่อใช้งานจริง</p>
+            <p className="text-xs text-slate-500">รองรับ jpg, jpeg, png, webp ขนาดไม่เกิน 5MB ระบบจะอัปโหลดไฟล์ไป Google Drive เมื่อบันทึก</p>
           </div>
         </Field>
         <Field label="หมายเหตุ" span><textarea className="input min-h-24" value={form.notes || ""} onChange={(e) => set("notes", e.target.value)} /></Field>
@@ -1429,10 +1503,27 @@ function Field({ label, children, span }) {
 }
 
 function ModalActions({ onClose, onSave }) {
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const handleSave = async () => {
+    if (saving) return;
+    try {
+      setSaving(true);
+      setError("");
+      await onSave();
+    } catch (saveError) {
+      setError(saveError.message || "บันทึกไม่สำเร็จ");
+    } finally {
+      setSaving(false);
+    }
+  };
   return (
-    <div className="mt-6 flex justify-end gap-2 border-t border-slate-200 pt-4">
-      <button className="btn-secondary" onClick={onClose}>ยกเลิก</button>
-      <button className="btn-primary" onClick={onSave}>บันทึก</button>
+    <div className="mt-6 border-t border-slate-200 pt-4">
+      {error && <p className="mb-3 rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-sm font-medium text-rose-700">{error}</p>}
+      <div className="flex justify-end gap-2">
+        <button className="btn-secondary" onClick={onClose} disabled={saving}>ยกเลิก</button>
+        <button className="btn-primary" onClick={handleSave} disabled={saving}>{saving ? "กำลังบันทึก..." : "บันทึก"}</button>
+      </div>
     </div>
   );
 }
@@ -1483,7 +1574,7 @@ function AssetDetail({ asset, history, openModal, currentUser, onUpdateImage, on
           </div>
           {asset.imageUrl ? (
             <button className="block w-full overflow-hidden rounded-md border border-slate-200 bg-slate-50" onClick={() => openModal({ type: "image", asset })}>
-              <img src={asset.imageUrl} className="h-64 w-full object-contain" alt={asset.assetName} />
+              <ImageWithFallback src={asset.imageUrl} className="h-64 w-full object-contain" alt={asset.assetName} />
             </button>
           ) : (
             <div className="grid h-44 place-items-center rounded-md border border-dashed border-slate-300 bg-slate-50 text-sm text-slate-500">
