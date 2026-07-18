@@ -64,6 +64,8 @@ const getAssetIdFromPath = () => {
 const IMAGE_ACCEPT = "image/jpeg,image/png,image/webp";
 const MAX_IMAGE_SIZE = 5 * 1024 * 1024;
 const LOCAL_FALLBACK_MESSAGE = "\u0e01\u0e33\u0e25\u0e31\u0e07\u0e43\u0e0a\u0e49\u0e02\u0e49\u0e2d\u0e21\u0e39\u0e25\u0e20\u0e32\u0e22\u0e43\u0e19\u0e40\u0e04\u0e23\u0e37\u0e48\u0e2d\u0e07 \u0e23\u0e39\u0e1b\u0e08\u0e30\u0e44\u0e21\u0e48\u0e0b\u0e34\u0e07\u0e01\u0e4c\u0e02\u0e49\u0e32\u0e21\u0e2d\u0e38\u0e1b\u0e01\u0e23\u0e13\u0e4c";
+const GOOGLE_SHEETS_ACTIVE_MESSAGE = "ใช้งาน Google Sheets อยู่";
+const GOOGLE_SHEETS_REQUIRED_MESSAGE = "ยังไม่ได้เชื่อมต่อ Google Sheets จึงไม่สามารถบันทึกข้อมูลหรือรูปได้";
 const isTemporaryImageUrl = (value = "") => /^blob:|^data:image\//.test(String(value));
 const stripTemporaryImageFields = (asset, { includeUpload = false } = {}) => {
   const { imagePreviewUrl, imageBase64, ...clean } = asset;
@@ -200,6 +202,7 @@ function App() {
   const [currentUser, setCurrentUser] = useState(loadCurrentUser);
   const [dataMode, setDataMode] = useState(appsScriptService.isAppsScriptConfigured() ? "loading" : "local");
   const [dataMessage, setDataMessage] = useState(appsScriptService.isAppsScriptConfigured() ? "" : LOCAL_FALLBACK_MESSAGE);
+  const [connectionTest, setConnectionTest] = useState(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [modal, setModal] = useState(null);
   const [filters, setFilters] = useState({
@@ -231,6 +234,15 @@ function App() {
     setDataMessage(message);
   };
 
+  const assertRemoteReady = () => {
+    if (!appsScriptService.isAppsScriptConfigured()) {
+      throw new Error(`${GOOGLE_SHEETS_REQUIRED_MESSAGE}: VITE_APPS_SCRIPT_URL ยังไม่มีค่า`);
+    }
+    if (dataMode !== "remote") {
+      throw new Error(`${GOOGLE_SHEETS_REQUIRED_MESSAGE}: ${dataMessage || "Apps Script ยังเชื่อมต่อไม่สำเร็จ"}`);
+    }
+  };
+
   const syncRemoteDb = async () => {
     if (!appsScriptService.isAppsScriptConfigured()) {
       markLocalFallback();
@@ -248,7 +260,29 @@ function App() {
       setDataMode("remote");
       setDataMessage("");
     } catch (error) {
-      markLocalFallback();
+      console.error("Google Apps Script sync failed", error);
+      markLocalFallback(`${LOCAL_FALLBACK_MESSAGE}: ${error.message}`);
+    }
+  };
+
+  const testGoogleSheetsConnection = async () => {
+    setConnectionTest({ status: "loading", message: "กำลังทดสอบการเชื่อมต่อ Google Sheet..." });
+    if (!appsScriptService.isAppsScriptConfigured()) {
+      const message = "VITE_APPS_SCRIPT_URL ยังไม่มีค่า";
+      markLocalFallback(`${LOCAL_FALLBACK_MESSAGE}: ${message}`);
+      setConnectionTest({ status: "error", message });
+      return;
+    }
+    try {
+      const assets = await appsScriptService.getAssets();
+      setDataMode("remote");
+      setDataMessage("");
+      setConnectionTest({ status: "success", message: `เชื่อมต่อ Google Sheet สำเร็จ พบ ${assets.length} รายการ` });
+      await syncRemoteDb();
+    } catch (error) {
+      console.error("Google Sheet connection test failed", error);
+      markLocalFallback(`${LOCAL_FALLBACK_MESSAGE}: ${error.message}`);
+      setConnectionTest({ status: "error", message: error.message });
     }
   };
 
@@ -285,7 +319,8 @@ function App() {
         setDataMessage("");
         await syncRemoteDb();
       } catch (error) {
-        markLocalFallback("กำลังใช้งานข้อมูลภายในเครื่อง");
+        console.error("Google Apps Script login failed", error);
+        markLocalFallback(`${LOCAL_FALLBACK_MESSAGE}: ${error.message}`);
       }
     }
     if (!user) {
@@ -351,6 +386,7 @@ function App() {
 
   const saveAsset = async (payload, existing) => {
     if (existing && currentUser.role !== "admin") return;
+    assertRemoteReady();
     const now = new Date().toISOString();
     const remoteReady = appsScriptService.isAppsScriptConfigured() && dataMode === "remote";
     const hasImageUpload = Boolean(payload.imageBase64);
@@ -448,6 +484,7 @@ function App() {
   };
 
   const updateAssetImage = async (asset, imagePayload) => {
+    assertRemoteReady();
     const remoteReady = appsScriptService.isAppsScriptConfigured() && dataMode === "remote";
     const hasImageUpload = Boolean(imagePayload.imageBase64);
     let updated = stripTemporaryImageFields({ ...asset, ...imagePayload, updatedAt: new Date().toISOString() }, { includeUpload: remoteReady });
@@ -641,11 +678,12 @@ function App() {
       <div className="lg:pl-72">
         <TopBar title={pageTitle} orgName={db.settings.organizationName} user={currentUser} onLogout={handleLogout} setSidebarOpen={setSidebarOpen} />
         <main className="px-4 py-5 sm:px-6 lg:px-8">
-          {dataMode === "local" && dataMessage && (
-            <div className="mb-4 rounded-md border border-amber-200 bg-amber-50 px-4 py-3 text-sm font-medium text-amber-800">
-              {dataMessage}
-            </div>
-          )}
+          <ConnectionStatus
+            dataMode={dataMode}
+            dataMessage={dataMessage}
+            connectionTest={connectionTest}
+            onTest={testGoogleSheetsConnection}
+          />
           {activePage === "dashboard" && (
             <Dashboard
               assets={db.assets}
@@ -1885,6 +1923,30 @@ function AccessDenied() {
         <ShieldCheck className="mx-auto mb-3 text-slate-400" size={42} />
         <h2 className="text-lg font-semibold">ไม่มีสิทธิ์เข้าถึง</h2>
         <p className="mt-1 text-sm text-slate-500">Staff สามารถดูรายการ ตรวจเช็ก แจ้งซ่อม และย้ายตำแหน่งได้ แต่ไม่สามารถจัดการหน้าตั้งค่า</p>
+      </div>
+    </section>
+  );
+}
+
+function ConnectionStatus({ dataMode, dataMessage, connectionTest, onTest }) {
+  const isRemote = dataMode === "remote";
+  const isLoading = dataMode === "loading" || connectionTest?.status === "loading";
+  const message = isRemote ? GOOGLE_SHEETS_ACTIVE_MESSAGE : dataMessage || LOCAL_FALLBACK_MESSAGE;
+  return (
+    <section className={`mb-4 rounded-md border px-4 py-3 ${isRemote ? "border-emerald-200 bg-emerald-50 text-emerald-800" : "border-amber-300 bg-amber-50 text-amber-900"}`}>
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <p className="text-sm font-bold">{message}</p>
+          {!isRemote && <p className="mt-1 text-sm font-semibold">กำลังใช้ข้อมูลภายในเครื่อง ข้อมูลและรูปจะไม่ซิงก์ข้ามอุปกรณ์</p>}
+          {connectionTest?.message && (
+            <p className={`mt-1 text-sm ${connectionTest.status === "error" ? "text-rose-700" : "text-slate-700"}`}>
+              {connectionTest.message}
+            </p>
+          )}
+        </div>
+        <button className={isRemote ? "btn-secondary" : "btn-primary"} type="button" onClick={onTest} disabled={isLoading}>
+          {isLoading ? "กำลังทดสอบ..." : "ทดสอบการเชื่อมต่อ Google Sheet"}
+        </button>
       </div>
     </section>
   );
