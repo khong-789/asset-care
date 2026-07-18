@@ -238,8 +238,12 @@ function normalizeAsset_() {
       merged[key] = source[key];
     });
   }
-  if (merged.imageUrl) {
-    merged.imageUrl = maybeSaveImage_(merged.imageUrl, merged.imageFileName || merged.assetName || "asset-image");
+  if (merged.imageBase64) {
+    merged.imageUrl = saveImageToDrive_(merged.imageBase64, merged.imageFileName || merged.assetName || "asset-image");
+    merged.imageBase64 = "";
+  }
+  if (merged.imageUrl && isTemporaryImageUrl_(merged.imageUrl)) {
+    throw new Error("imageUrl must be a permanent URL. Upload imageBase64 instead.");
   }
   if (merged.imageUrl && !merged.imageUpdatedAt) {
     merged.imageUpdatedAt = new Date().toISOString();
@@ -254,13 +258,20 @@ function normalizeAsset_() {
 
 function maybeSaveImage_(value, fileName) {
   if (!value || typeof value !== "string") return "";
+  if (isTemporaryImageUrl_(value) && value.indexOf("data:image/") !== 0) {
+    throw new Error("Temporary blob URL cannot be saved");
+  }
   if (!value.indexOf || value.indexOf("data:image/") !== 0) return value;
   return saveImageToDrive_(value, fileName);
 }
 
+function isTemporaryImageUrl_(value) {
+  return typeof value === "string" && (value.indexOf("data:image/") === 0 || value.indexOf("blob:") === 0);
+}
+
 function saveImageToDrive_(dataUrl, fileName) {
   const match = dataUrl.match(/^data:(image\/(?:jpeg|jpg|png|webp));base64,(.+)$/);
-  if (!match) return dataUrl;
+  if (!match) throw new Error("Invalid image upload payload");
   const mimeType = match[1] === "image/jpg" ? "image/jpeg" : match[1];
   const extension = mimeType.split("/")[1].replace("jpeg", "jpg");
   const bytes = Utilities.base64Decode(match[2]);
@@ -268,8 +279,9 @@ function saveImageToDrive_(dataUrl, fileName) {
   const blob = Utilities.newBlob(bytes, mimeType, safeName.indexOf(".") > -1 ? safeName : safeName + "." + extension);
   const folder = getImageFolder_();
   const file = folder.createFile(blob);
+  if (!file || !file.getId()) throw new Error("Google Drive image upload failed");
   file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
-  return "https://drive.google.com/uc?export=view&id=" + file.getId();
+  return "https://drive.google.com/thumbnail?id=" + file.getId() + "&sz=w1200";
 }
 
 function readSettings_() {
@@ -375,7 +387,7 @@ function ensureHeaders_(sheet, columns) {
 
 function getImageFolder_() {
   if (DRIVE_FOLDER_ID) return DriveApp.getFolderById(DRIVE_FOLDER_ID);
-  const name = "Asset Care Images";
+  const name = "asset_register_uploads";
   const folders = DriveApp.getFoldersByName(name);
   return folders.hasNext() ? folders.next() : DriveApp.createFolder(name);
 }
