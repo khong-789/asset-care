@@ -13,10 +13,12 @@ const parseResponse = async (response) => {
   try {
     result = JSON.parse(text);
   } catch {
-    throw new Error("Apps Script did not return JSON");
+    console.error("Apps Script non-JSON response", { status: response.status, text });
+    throw new Error(`Apps Script did not return JSON (HTTP ${response.status})`);
   }
   if (!response.ok || !result.success) {
-    throw new Error(result.error || "Apps Script request failed");
+    console.error("Apps Script request failed", { status: response.status, result });
+    throw new Error(result.error || `Apps Script request failed (HTTP ${response.status})`);
   }
   return result.data;
 };
